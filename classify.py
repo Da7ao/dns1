@@ -36,9 +36,10 @@ N_BAGS        = 300
 
 # PU Learning：恶意概率阈值，超过此值视为候选恶意域名
 BIN_THRESHOLD = 0.5
+MIN_CANDIDATES = 1000
 
 # 最终输出条数上限
-MAX_OUTPUT    = 800
+MAX_OUTPUT    = 1000
 
 RANDOM_STATE  = 42
 
@@ -147,13 +148,14 @@ def pu_bagging(X_pos, X_unlabeled, n_bags=N_BAGS, random_state=RANDOM_STATE):
 
 
 def select_candidates(avg_prob, unlabeled_fqdns, threshold=BIN_THRESHOLD):
-    candidates = [
-        (fqdn, float(prob))
-        for fqdn, prob in zip(unlabeled_fqdns, avg_prob)
-        if prob >= threshold
-    ]
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    print(f"\n候选恶意域名: {len(candidates)} 条 (阈值={threshold})")
+    all_scored = [(fqdn, float(prob)) for fqdn, prob in zip(unlabeled_fqdns, avg_prob)]
+    all_scored.sort(key=lambda x: x[1], reverse=True)
+    candidates = [x for x in all_scored if x[1] >= threshold]
+    if len(candidates) < MIN_CANDIDATES:
+        candidates = all_scored[:MIN_CANDIDATES]
+        print(f"\n候选恶意域名不足 {MIN_CANDIDATES} 条，改用 Top-{MIN_CANDIDATES} 策略")
+    else:
+        print(f"\n候选恶意域名: {len(candidates)} 条 (阈值={threshold})")
 
     # 打印概率分布分段，辅助判断阈值合理性
     thresholds = [0.9, 0.8, 0.7, 0.6, 0.5]
@@ -249,17 +251,17 @@ def train_multiclass(X_pos, y_pos_multi, target_per_class=60):
     clf_rf.fit(X_res, y_res)
     clf_et.fit(X_res, y_res)
 
-    # 家族先验：用于温和修正极端少样本家族概率
-    class_counts = Counter(y_pos_multi.tolist())
-    total = sum(class_counts.values())
-    class_priors = {
-        cls: (cnt + 2.0) / (total + 2.0 * len(class_counts))
-        for cls, cnt in class_counts.items()
-    }
-    return (clf_rf, clf_et), scaler, class_priors
+    # 构建每个家族的“原型中心”（在标准化空间中）
+    class_order = np.array(sorted(set(y_pos_multi.tolist())), dtype=np.int32)
+    centroids = []
+    for cls in class_order:
+        cls_vecs = X_scaled[y_pos_multi == cls]
+        centroids.append(cls_vecs.mean(axis=0))
+    centroids = np.vstack(centroids)
+    return (clf_rf, clf_et), scaler, (class_order, centroids)
 
 
-def predict_multiclass(clf_pack, scaler, class_priors, X_matrix, fqdn_to_idx, candidates):
+def predict_multiclass(clf_pack, scaler, class_proto, X_matrix, fqdn_to_idx, candidates):
     if not candidates:
         return []
 
@@ -276,12 +278,14 @@ def predict_multiclass(clf_pack, scaler, class_priors, X_matrix, fqdn_to_idx, ca
     p_et = clf_et.predict_proba(X_scaled)
     pred_proba = 0.55 * p_rf + 0.45 * p_et
 
-    # 先验修正（只做轻微拉动，避免过拟合到头部类）
-    class_order = clf_rf.classes_
-    prior_vec = np.array([class_priors[int(c)] for c in class_order], dtype=np.float64)
-    prior_vec = prior_vec / prior_vec.mean()
-    pred_proba = pred_proba * (0.85 + 0.15 * prior_vec[None, :])
-    pred_proba = pred_proba / pred_proba.sum(axis=1, keepdims=True)
+    # 与家族原型的相似度分布（辅助修正 RF/ET 的多分类概率）
+    class_order, centroids = class_proto
+    sim = X_scaled @ centroids.T
+    sim = sim - sim.max(axis=1, keepdims=True)
+    sim_prob = np.exp(sim)
+    sim_prob = sim_prob / sim_prob.sum(axis=1, keepdims=True)
+    # class_order 与 clf 类别顺序一致（均为 0~8），做轻量融合
+    pred_proba = 0.8 * pred_proba + 0.2 * sim_prob
 
     pred_labels = class_order[np.argmax(pred_proba, axis=1)]
     top1 = pred_proba.max(axis=1)
@@ -347,9 +351,9 @@ def main():
     candidates = select_candidates(avg_prob, unlabeled_fqdns, threshold=BIN_THRESHOLD)
 
     # 4. 多分类 → 归入家族
-    multi_clf, multi_scaler, class_priors = train_multiclass(X_pos, y_pos_multi, target_per_class=60)
+    multi_clf, multi_scaler, class_proto = train_multiclass(X_pos, y_pos_multi, target_per_class=60)
     results = predict_multiclass(
-        multi_clf, multi_scaler, class_priors, X_matrix, fqdn_to_idx, candidates
+        multi_clf, multi_scaler, class_proto, X_matrix, fqdn_to_idx, candidates
     )
 
     # 5. 排序输出
