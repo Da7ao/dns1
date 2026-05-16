@@ -183,6 +183,8 @@ def extract_domainname_features(encoded_fqdn):
         "digit_ratio": 0.0,
         "word_ratio": 0.0,
         "dot_ratio": 0.0,
+        "label_count": 0,
+        "max_label_length": 0,
     }
 
     parts = encoded_fqdn.split(".")
@@ -194,7 +196,8 @@ def extract_domainname_features(encoded_fqdn):
     if suffix.lower() in COMMON_TLDS:
         result["is_common_tld"] = 1
 
-    word_pattern = re.compile(r'\[a+]')
+    # 匹配编码后的词块，如 [aaaa]、[aaaaaaaa]
+    word_pattern = re.compile(r'\[a+\]')
     words = word_pattern.findall(prefix)
     result["word_count"] = len(words)
 
@@ -204,6 +207,10 @@ def extract_domainname_features(encoded_fqdn):
     result["letter_count"] = pure_prefix.count("a")
     result["digit_count"] = pure_prefix.count("0")
 
+    labels = [p for p in pure_prefix.split(".") if p]
+    result["label_count"] = len(labels)
+    result["max_label_length"] = max((len(x) for x in labels), default=0)
+
     total = len(pure_prefix) + result["word_count"]
 
     if total > 0:
@@ -211,7 +218,6 @@ def extract_domainname_features(encoded_fqdn):
         result["digit_ratio"] = round(result["digit_count"] / total * 100, 2)
         result["word_ratio"] = round(result["word_count"] / total * 100, 2)
         result["dot_ratio"] = round(result["dot_count"] / total * 100, 2)
-
     return result
 
 
@@ -253,6 +259,8 @@ def extract_access_features(access_data, access_ip_info=None):
         'unique_client_ip_count': 0,        # 访问IP种类数
         'consecutive_ip_ratio': 0.0,        # 连续访问IP / 所有IP
         'same_day_consecutive_ip_ratio': 0.0,  # 同一天连续IP / 所有连续IP
+        'request_burstiness': 0.0,             # 请求突发性：std/mean
+        'workhour_request_ratio': 0.0,         # 工作时段(9~18)请求占比
     }
 
     if not access_data:
@@ -305,6 +313,13 @@ def extract_access_features(access_data, access_ip_info=None):
 
     night_requests = sum(item['request_cnt'] for item in access_data if int(item['hour']) < 6)
     result['night_request_ratio'] = night_requests / total_request_cnt if total_request_cnt > 0 else 0
+    workhour_requests = sum(
+        item['request_cnt'] for item in access_data
+        if 9 <= int(item['hour']) <= 18
+    )
+    result['workhour_request_ratio'] = workhour_requests / total_request_cnt if total_request_cnt > 0 else 0.0
+    if request_ratio_mean > 0:
+        result['request_burstiness'] = (request_ratio_var ** 0.5) / request_ratio_mean
 
     # ── 客户端 IP 特征 ────────────────────────────────────────
     if access_ip_info:
@@ -428,6 +443,7 @@ def extract_flint_features(fqdn_key, flint_data, all_flint_dict, malicious_fqdns
         'cname_target_is_malicious': 0,  # CNAME指向的域名是否为恶意域名
         'resolved_ip_is_malicious': 0,   # 解析到的IP是否被恶意域名使用
         'resolved_ipv6_is_malicious': 0, # 解析到的IPv6是否被恶意域名使用
+        'ipv6_ratio_in_ips': 0.0,        # 在A/AAAA记录中，AAAA占比
     }
 
     flint_types = [item["flintType"] for item in flint_data]
@@ -448,6 +464,9 @@ def extract_flint_features(fqdn_key, flint_data, all_flint_dict, malicious_fqdns
     # ── IP 特征 ───────────────────────────────────────────────
     unique_ips = {item['encoded_value'] for item in flint_data if item['flintType'] in (1, 28)}
     result['unique_ip_count'] = len(unique_ips)
+    ip_records = sum(1 for item in flint_data if item['flintType'] in (1, 28))
+    if ip_records > 0:
+        result['ipv6_ratio_in_ips'] = type_count.get(28, 0) / ip_records
 
     ip_request_cnt = defaultdict(int)
     for item in flint_data:

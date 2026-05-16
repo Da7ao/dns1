@@ -17,7 +17,7 @@ import csv
 import os
 import numpy as np
 from collections import Counter
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, ExtraTreesClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 
@@ -36,9 +36,10 @@ N_BAGS        = 300
 
 # PU Learning：恶意概率阈值，超过此值视为候选恶意域名
 BIN_THRESHOLD = 0.5
+MIN_CANDIDATES = 1000
 
 # 最终输出条数上限
-MAX_OUTPUT    = 800
+MAX_OUTPUT    = 1000
 
 RANDOM_STATE  = 42
 
@@ -147,13 +148,14 @@ def pu_bagging(X_pos, X_unlabeled, n_bags=N_BAGS, random_state=RANDOM_STATE):
 
 
 def select_candidates(avg_prob, unlabeled_fqdns, threshold=BIN_THRESHOLD):
-    candidates = [
-        (fqdn, float(prob))
-        for fqdn, prob in zip(unlabeled_fqdns, avg_prob)
-        if prob >= threshold
-    ]
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    print(f"\n候选恶意域名: {len(candidates)} 条 (阈值={threshold})")
+    all_scored = [(fqdn, float(prob)) for fqdn, prob in zip(unlabeled_fqdns, avg_prob)]
+    all_scored.sort(key=lambda x: x[1], reverse=True)
+    candidates = [x for x in all_scored if x[1] >= threshold]
+    if len(candidates) < MIN_CANDIDATES:
+        candidates = all_scored[:MIN_CANDIDATES]
+        print(f"\n候选恶意域名不足 {MIN_CANDIDATES} 条，改用 Top-{MIN_CANDIDATES} 策略")
+    else:
+        print(f"\n候选恶意域名: {len(candidates)} 条 (阈值={threshold})")
 
     # 打印概率分布分段，辅助判断阈值合理性
     thresholds = [0.9, 0.8, 0.7, 0.6, 0.5]
@@ -223,27 +225,43 @@ def train_multiclass(X_pos, y_pos_multi, target_per_class=60):
                                     target_per_class=target_per_class)
     print(f"过采样后分布: {sorted(Counter(y_res.tolist()).items())}")
 
-    clf = RandomForestClassifier(
+    clf_rf = RandomForestClassifier(
         n_estimators=1000,
         max_depth=None,
-        class_weight='balanced',   # 过采样后仍保留，双重保障
+        class_weight='balanced_subsample',
         min_samples_leaf=1,
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
+    clf_et = ExtraTreesClassifier(
+        n_estimators=1200,
+        max_depth=None,
+        class_weight='balanced_subsample',
+        min_samples_leaf=1,
+        random_state=RANDOM_STATE + 7,
+        n_jobs=-1,
+    )
 
-    # 过采样后最小类已有 target_per_class 条，可以用5折
+    # 过采样后最小类已有 target_per_class 条，可以用5折（仅评估RF）
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    scores = cross_val_score(clf, X_res, y_res, cv=cv, scoring='f1_macro')
+    scores = cross_val_score(clf_rf, X_res, y_res, cv=cv, scoring='f1_macro')
     print(f"多分类 CV Macro F1 (5折, 过采样后): {scores.mean():.4f} ± {scores.std():.4f}")
 
-    # 注意：最终模型用原始数据训练（不用过采样数据），避免泛化问题
-    # 若CV分数很低，可改为 clf.fit(X_res, y_res)
-    clf.fit(X_res, y_res)
-    return clf, scaler
+    # 最终模型：两种树模型做软投票，稳定长尾家族预测
+    clf_rf.fit(X_res, y_res)
+    clf_et.fit(X_res, y_res)
+
+    # 构建每个家族的“原型中心”（在标准化空间中）
+    class_order = np.array(sorted(set(y_pos_multi.tolist())), dtype=np.int32)
+    centroids = []
+    for cls in class_order:
+        cls_vecs = X_scaled[y_pos_multi == cls]
+        centroids.append(cls_vecs.mean(axis=0))
+    centroids = np.vstack(centroids)
+    return (clf_rf, clf_et), scaler, (class_order, centroids)
 
 
-def predict_multiclass(clf, scaler, X_matrix, fqdn_to_idx, candidates):
+def predict_multiclass(clf_pack, scaler, class_proto, X_matrix, fqdn_to_idx, candidates):
     if not candidates:
         return []
 
@@ -255,9 +273,25 @@ def predict_multiclass(clf, scaler, X_matrix, fqdn_to_idx, candidates):
         dtype=np.float32,
     )
     X_scaled     = scaler.transform(X_cand)
-    pred_labels  = clf.predict(X_scaled)
-    pred_proba   = clf.predict_proba(X_scaled)
-    multi_conf   = pred_proba.max(axis=1)
+    clf_rf, clf_et = clf_pack
+    p_rf = clf_rf.predict_proba(X_scaled)
+    p_et = clf_et.predict_proba(X_scaled)
+    pred_proba = 0.55 * p_rf + 0.45 * p_et
+
+    # 与家族原型的相似度分布（辅助修正 RF/ET 的多分类概率）
+    class_order, centroids = class_proto
+    sim = X_scaled @ centroids.T
+    sim = sim - sim.max(axis=1, keepdims=True)
+    sim_prob = np.exp(sim)
+    sim_prob = sim_prob / sim_prob.sum(axis=1, keepdims=True)
+    # class_order 与 clf 类别顺序一致（均为 0~8），做轻量融合
+    pred_proba = 0.8 * pred_proba + 0.2 * sim_prob
+
+    pred_labels = class_order[np.argmax(pred_proba, axis=1)]
+    top1 = pred_proba.max(axis=1)
+    sorted_prob = np.sort(pred_proba, axis=1)
+    margin = sorted_prob[:, -1] - sorted_prob[:, -2]
+    multi_conf = 0.7 * top1 + 0.3 * margin
 
     results = [
         (fqdn, int(family), float(bp), float(mc))
@@ -317,9 +351,9 @@ def main():
     candidates = select_candidates(avg_prob, unlabeled_fqdns, threshold=BIN_THRESHOLD)
 
     # 4. 多分类 → 归入家族
-    multi_clf, multi_scaler = train_multiclass(X_pos, y_pos_multi, target_per_class=60)
+    multi_clf, multi_scaler, class_proto = train_multiclass(X_pos, y_pos_multi, target_per_class=60)
     results = predict_multiclass(
-        multi_clf, multi_scaler, X_matrix, fqdn_to_idx, candidates
+        multi_clf, multi_scaler, class_proto, X_matrix, fqdn_to_idx, candidates
     )
 
     # 5. 排序输出
