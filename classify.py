@@ -17,7 +17,7 @@ import csv
 import os
 import numpy as np
 from collections import Counter
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, ExtraTreesClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 
@@ -223,27 +223,43 @@ def train_multiclass(X_pos, y_pos_multi, target_per_class=60):
                                     target_per_class=target_per_class)
     print(f"过采样后分布: {sorted(Counter(y_res.tolist()).items())}")
 
-    clf = RandomForestClassifier(
+    clf_rf = RandomForestClassifier(
         n_estimators=1000,
         max_depth=None,
-        class_weight='balanced',   # 过采样后仍保留，双重保障
+        class_weight='balanced_subsample',
         min_samples_leaf=1,
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
+    clf_et = ExtraTreesClassifier(
+        n_estimators=1200,
+        max_depth=None,
+        class_weight='balanced_subsample',
+        min_samples_leaf=1,
+        random_state=RANDOM_STATE + 7,
+        n_jobs=-1,
+    )
 
-    # 过采样后最小类已有 target_per_class 条，可以用5折
+    # 过采样后最小类已有 target_per_class 条，可以用5折（仅评估RF）
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    scores = cross_val_score(clf, X_res, y_res, cv=cv, scoring='f1_macro')
+    scores = cross_val_score(clf_rf, X_res, y_res, cv=cv, scoring='f1_macro')
     print(f"多分类 CV Macro F1 (5折, 过采样后): {scores.mean():.4f} ± {scores.std():.4f}")
 
-    # 注意：最终模型用原始数据训练（不用过采样数据），避免泛化问题
-    # 若CV分数很低，可改为 clf.fit(X_res, y_res)
-    clf.fit(X_res, y_res)
-    return clf, scaler
+    # 最终模型：两种树模型做软投票，稳定长尾家族预测
+    clf_rf.fit(X_res, y_res)
+    clf_et.fit(X_res, y_res)
+
+    # 家族先验：用于温和修正极端少样本家族概率
+    class_counts = Counter(y_pos_multi.tolist())
+    total = sum(class_counts.values())
+    class_priors = {
+        cls: (cnt + 2.0) / (total + 2.0 * len(class_counts))
+        for cls, cnt in class_counts.items()
+    }
+    return (clf_rf, clf_et), scaler, class_priors
 
 
-def predict_multiclass(clf, scaler, X_matrix, fqdn_to_idx, candidates):
+def predict_multiclass(clf_pack, scaler, class_priors, X_matrix, fqdn_to_idx, candidates):
     if not candidates:
         return []
 
@@ -255,9 +271,23 @@ def predict_multiclass(clf, scaler, X_matrix, fqdn_to_idx, candidates):
         dtype=np.float32,
     )
     X_scaled     = scaler.transform(X_cand)
-    pred_labels  = clf.predict(X_scaled)
-    pred_proba   = clf.predict_proba(X_scaled)
-    multi_conf   = pred_proba.max(axis=1)
+    clf_rf, clf_et = clf_pack
+    p_rf = clf_rf.predict_proba(X_scaled)
+    p_et = clf_et.predict_proba(X_scaled)
+    pred_proba = 0.55 * p_rf + 0.45 * p_et
+
+    # 先验修正（只做轻微拉动，避免过拟合到头部类）
+    class_order = clf_rf.classes_
+    prior_vec = np.array([class_priors[int(c)] for c in class_order], dtype=np.float64)
+    prior_vec = prior_vec / prior_vec.mean()
+    pred_proba = pred_proba * (0.85 + 0.15 * prior_vec[None, :])
+    pred_proba = pred_proba / pred_proba.sum(axis=1, keepdims=True)
+
+    pred_labels = class_order[np.argmax(pred_proba, axis=1)]
+    top1 = pred_proba.max(axis=1)
+    sorted_prob = np.sort(pred_proba, axis=1)
+    margin = sorted_prob[:, -1] - sorted_prob[:, -2]
+    multi_conf = 0.7 * top1 + 0.3 * margin
 
     results = [
         (fqdn, int(family), float(bp), float(mc))
@@ -317,9 +347,9 @@ def main():
     candidates = select_candidates(avg_prob, unlabeled_fqdns, threshold=BIN_THRESHOLD)
 
     # 4. 多分类 → 归入家族
-    multi_clf, multi_scaler = train_multiclass(X_pos, y_pos_multi, target_per_class=60)
+    multi_clf, multi_scaler, class_priors = train_multiclass(X_pos, y_pos_multi, target_per_class=60)
     results = predict_multiclass(
-        multi_clf, multi_scaler, X_matrix, fqdn_to_idx, candidates
+        multi_clf, multi_scaler, class_priors, X_matrix, fqdn_to_idx, candidates
     )
 
     # 5. 排序输出
